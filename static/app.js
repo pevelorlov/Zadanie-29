@@ -9,7 +9,7 @@ const ui = {
   profilePreferredFormats: $("#profile-preferred-formats"), profileAvoidFormats: $("#profile-avoid-formats"), profileInstructions: $("#profile-instructions"), profileSave: $("#profile-save"), profileError: $("#profile-error"),
   chatTitle: $("#chat-title"), subtitle: $("#chat-subtitle"), exportButton: $("#export-button"), deleteChat: $("#delete-chat"),
   messages: $("#messages"), form: $("#message-form"), input: $("#message-input"), send: $("#send-button"), error: $("#form-error"),
-  voiceButton: $("#voice-button"), voiceStatus: $("#voice-status"),
+  voiceEnabled: $("#voice-enabled"), voiceButton: $("#voice-button"), voiceStatus: $("#voice-status"),
   presetSelect: $("#preset-select"), settingsToggle: $("#settings-toggle"), settingsPanel: $("#settings-panel"), settingsClose: $("#settings-close"),
   settingsSummary: $("#settings-summary"), resetCustom: $("#reset-custom"), saveAsPreset: $("#save-as-preset"), presetsButton: $("#presets-button"),
   requestStatus: $("#request-status"), tokenOverview: $("#token-overview"),
@@ -105,12 +105,13 @@ let sending = false;
 let autopilotRunning = false;
 let autopilotStopRequested = false;
 const MAX_AUTOPILOT_TRANSITIONS = 6;
-let voiceState = { phase: "starting", ready: false, message: "Whisper запускается…" };
+let voiceState = { phase: "stopped", ready: false, message: "Whisper выключен." };
 let mediaRecorder = null;
 let microphoneStream = null;
 let audioChunks = [];
 let recordingTimer = null;
 let voiceBusy = false;
+let voiceToggleBusy = false;
 let voiceSubmitAfterTranscription = false;
 let mcpControlState = { enabled: true, updated_at: null };
 let mcpControlBusy = false;
@@ -692,14 +693,53 @@ function renderVoiceStatus() {
   if (mediaRecorder?.state === "recording" || voiceBusy) return;
   ui.voiceStatus.textContent = voiceState.message || "Whisper недоступен.";
   ui.voiceStatus.className = `voice-status ${voiceState.phase || "error"}`;
+  ui.voiceEnabled.checked = voiceState.ready || voiceState.phase === "starting";
+  ui.voiceEnabled.disabled = voiceToggleBusy;
   ui.voiceButton.disabled = sending || taskIsPaused() || !voiceState.ready;
   ui.voiceButton.classList.remove("recording", "processing");
   ui.voiceButton.title = voiceState.ready ? "Надиктовать сообщение" : ui.voiceStatus.textContent;
 }
 
+async function toggleVoiceService() {
+  if (voiceToggleBusy || voiceBusy || mediaRecorder?.state === "recording") return;
+  const enabled = ui.voiceEnabled.checked;
+  voiceToggleBusy = true;
+  voiceState = {
+    ...voiceState,
+    phase: enabled ? "starting" : "stopped",
+    ready: false,
+    message: enabled ? "Запускаем Whisper…" : "Выключаем Whisper…",
+  };
+  renderVoiceStatus();
+  try {
+    const data = await api(`/api/voice/${enabled ? "start" : "stop"}`, { method: "POST" });
+    voiceState = data.voice;
+  } catch (error) {
+    voiceState = { phase: "error", ready: false, message: error.message || String(error) };
+  } finally {
+    voiceToggleBusy = false;
+    renderVoiceStatus();
+  }
+}
+
 function populateModels() {
   ui.model.replaceChildren();
-  appState.provider.models.forEach((model) => ui.model.add(new Option(model, model)));
+  const providers = appState.provider.providers || {};
+  Object.values(providers).forEach((provider) => {
+    const group = document.createElement("optgroup");
+    group.label = provider.label;
+    (provider.models || []).forEach((model) => group.append(new Option(model, model)));
+    ui.model.append(group);
+  });
+  if (!ui.model.options.length) {
+    appState.provider.models.forEach((model) => ui.model.add(new Option(model, model)));
+  }
+}
+
+function modelProviderLabel(model) {
+  if (appState.provider?.providers?.lm_studio?.models?.includes(model)) return "LM Studio · локально";
+  if (appState.provider?.providers?.deepseek?.models?.includes(model)) return "DeepSeek · облако";
+  return "LLM";
 }
 
 async function createConversation(projectId = null) {
@@ -877,7 +917,7 @@ function conversationSidebarItem(conversation) {
   row.append(open);
   if (conversation.project_id) {
     const extract = button("↻", "extract-history-button", () => extractHistoryMemory(conversation.id, extract));
-    extract.title = "Извлечь память проекта из успешной истории активной ветки. Использует отдельный запрос DeepSeek.";
+    extract.title = "Извлечь память проекта из успешной истории активной ветки. Использует отдельный запрос локальной модели.";
     extract.setAttribute("aria-label", `Извлечь память из истории: ${conversation.title}`);
     row.append(extract);
   }
@@ -901,7 +941,7 @@ async function dropConversationOnProject(event, targetProjectId, section) {
 
 async function extractHistoryMemory(conversationId, control) {
   const original = control.textContent; control.disabled = true; control.textContent = "…";
-  ui.sidebarProjectStatus.textContent = "Извлекаем память из истории через DeepSeek…";
+  ui.sidebarProjectStatus.textContent = "Извлекаем память из истории через локальную модель…";
   try {
     const data = await api(`/api/conversations/${conversationId}/extract-project-memory`, { method: "POST", body: {} });
     await refreshState();
@@ -977,7 +1017,7 @@ function renderMessages() {
     element.querySelector(".message-avatar").textContent = automaticContinuation ? "A" : (message.role === "user" ? profileName.slice(0, 1).toUpperCase() : "D");
     element.querySelector("header strong").textContent = message.role === "user"
       ? (automaticContinuation ? "Автопилот" : profileName)
-      : (localCommand ? "Состояние задачи · сервер" : `DeepSeek · профиль «${profileName}»`);
+      : (localCommand ? "Состояние задачи · сервер" : `${modelProviderLabel(message.technical?.model)} · профиль «${profileName}»`);
     element.querySelector("time").textContent = formatDate(message.created_at, true);
     element.querySelector(".message-text").textContent = message.content;
     const ragAudit = message.technical?.rag;
@@ -1076,7 +1116,7 @@ function createMcpCallsPanel(calls, { live = false, phase = "" } = {}) {
   panel.append(heading);
   if (!calls?.length) {
     const waiting = document.createElement("small");
-    waiting.textContent = phase === "thinking" ? "DeepSeek выбирает подходящие инструменты…" : "Ожидаем вызов инструмента…";
+    waiting.textContent = phase === "thinking" ? "Модель выбирает подходящие инструменты…" : "Ожидаем вызов инструмента…";
     panel.append(waiting);
     return panel;
   }
@@ -1427,7 +1467,7 @@ function renderContextPanel() {
   const labels = { full: "Полная история", summary: "Summary", sliding: "Sliding Window", facts: "Sticky Facts" };
   const rules = {
     full: "В запрос отправляется вся успешная история только текущего посещения этапа.",
-    summary: "Внутри текущего этапа последние 5 обменов остаются дословно, а старые сворачиваются моделью deepseek-v4-flash.",
+    summary: "Внутри текущего этапа последние 5 обменов остаются дословно, а старые сворачиваются локальной моделью.",
     sliding: `В запрос отправляются только последние ${context.sliding_window_exchanges || 5} обменов текущего этапа.`,
     facts: `Facts текущего этапа обновляются после каждого сообщения и отправляются вместе с последними ${context.facts_window_exchanges || 5} его обменами.`,
   };
@@ -1566,8 +1606,8 @@ function renderMessageTokens(container, message, tokenIndex) {
   container.hidden = false;
   if (message.role === "user") {
     addTokenBadge(container, "Контекст вызова", exchange.usage.input_tokens, "Системный промпт, предыдущая история и этот запрос");
-    addTokenBadge(container, "Из кэша", exchange.usage.cached_input_tokens, "Входные токены, найденные в кэше DeepSeek");
-    addTokenBadge(container, "Без кэша", exchange.usage.uncached_input_tokens, "Входные токены, не найденные в кэше DeepSeek");
+    addTokenBadge(container, "Из кэша", exchange.usage.cached_input_tokens, "Входные токены, найденные в кэше провайдера");
+    addTokenBadge(container, "Без кэша", exchange.usage.uncached_input_tokens, "Входные токены, не найденные в кэше провайдера");
   } else if (message.role === "assistant") {
     addTokenBadge(container, "Выход с reasoning", exchange.usage.output_tokens, "Все выходные токены, включая reasoning");
     addTokenBadge(container, "Reasoning внутри", exchange.usage.reasoning_tokens, "Часть выходных токенов; отдельно к итогу не прибавляется");
@@ -1580,15 +1620,36 @@ function renderTokenOverview() {
   ui.tokenOverview.replaceChildren();
   const messages = conversationMessages();
   const totals = buildTokenIndex(messages).totals;
-  if (!totals.request_count) { ui.tokenOverview.hidden = true; return; }
   ui.tokenOverview.hidden = false;
-  addTokenBadge(ui.tokenOverview, "Σ диалога", totals.total_tokens, "Входные плюс выходные токены всех вызовов; reasoning уже входит в выходные");
-  addTokenBadge(ui.tokenOverview, "Σ контекст", totals.input_tokens);
-  addTokenBadge(ui.tokenOverview, "Σ выход", totals.output_tokens, "Все выходные токены, включая reasoning");
-  addTokenBadge(ui.tokenOverview, "Σ reasoning", totals.reasoning_tokens, "Часть Σ выхода; отдельно к Σ диалога не прибавляется");
-  addTokenBadge(ui.tokenOverview, "Σ кэш", totals.cached_input_tokens);
-  addTokenBadge(ui.tokenOverview, "Вызовов", totals.request_count);
-  renderContextWindowUsage(messages);
+  if (totals.request_count) {
+    addTokenBadge(ui.tokenOverview, "Σ диалога", totals.total_tokens, "Входные плюс выходные токены всех вызовов; reasoning уже входит в выходные");
+    addTokenBadge(ui.tokenOverview, "Σ контекст", totals.input_tokens);
+    addTokenBadge(ui.tokenOverview, "Σ выход", totals.output_tokens, "Все выходные токены, включая reasoning");
+    addTokenBadge(ui.tokenOverview, "Σ reasoning", totals.reasoning_tokens, "Часть Σ выхода; отдельно к Σ диалога не прибавляется");
+    addTokenBadge(ui.tokenOverview, "Σ кэш", totals.cached_input_tokens);
+    addTokenBadge(ui.tokenOverview, "Вызовов", totals.request_count);
+    renderContextWindowUsage(messages);
+  }
+  renderSelectedModelContextLimit();
+  if (!ui.tokenOverview.children.length) ui.tokenOverview.hidden = true;
+}
+
+function renderSelectedModelContextLimit() {
+  const model = ui.model.value;
+  const windowTokens = Number(appState.provider?.context_windows?.[model]) || 0;
+  if (!model || !windowTokens) return;
+  const wrapper = document.createElement("div");
+  wrapper.className = "context-window-usage selected-model-limit";
+  wrapper.title = "Контекстное окно модели, выбранной для следующего сообщения.";
+  const label = document.createElement("div");
+  label.className = "context-window-label";
+  const caption = document.createElement("small");
+  caption.textContent = `Выбрано для следующего запроса · ${model}`;
+  const value = document.createElement("strong");
+  value.textContent = `${number(windowTokens)} токенов`;
+  label.append(caption, value);
+  wrapper.append(label);
+  ui.tokenOverview.append(wrapper);
 }
 
 function renderContextWindowUsage(messages) {
@@ -1675,6 +1736,7 @@ function applySettings(settings) {
   ui.format.value = settings.response_format; ui.logprobs.checked = settings.logprobs;
   ui.topLogprobs.value = settings.top_logprobs ?? "";
   updateSettingsSummary();
+  if (activeConversation) renderTokenOverview();
 }
 
 function readSettings() {
@@ -1851,7 +1913,7 @@ function renderPendingExchange(content) {
   user.querySelector(".technical").remove(); user.querySelector(".reasoning").remove(); user.querySelector(".message-actions").remove();
 
   const waiting = document.createElement("article"); waiting.className = "message assistant waiting-message";
-  waiting.innerHTML = '<div class="message-avatar">D</div><div class="message-body"><header><strong>DeepSeek</strong><span class="sent-badge">Запрос получен</span></header><div class="thinking-line"><i></i><i></i><i></i><span>Формирует ответ…</span></div></div>';
+  waiting.innerHTML = `<div class="message-avatar">L</div><div class="message-body"><header><strong>${modelProviderLabel(ui.model.value)}</strong><span class="sent-badge">Запрос получен</span></header><div class="thinking-line"><i></i><i></i><i></i><span>Формирует ответ…</span></div></div>`;
   ui.messages.append(waiting); ui.messages.scrollTop = ui.messages.scrollHeight;
   return [user, waiting];
 }
@@ -2544,7 +2606,7 @@ async function runRagSearch(event) {
     const data = await api("/api/rag/search", { method: "POST", body: { query: ui.ragSearchQuery.value, top_k: Number(ui.ragSearchTopK.value) } });
     renderRagSearchResults(ui.ragFixedResults, data.results.fixed || []);
     renderRagSearchResults(ui.ragStructuralResults, data.results.structural || []);
-    ui.ragSearchMessage.textContent = `Найдено по ${data.top_k} результатов в каждом индексе. DeepSeek не вызывался.`;
+    ui.ragSearchMessage.textContent = `Найдено по ${data.top_k} результатов в каждом индексе. LLM не вызывалась.`;
   } catch (error) { ui.ragSearchMessage.textContent = error.message || String(error); }
 }
 
@@ -2666,7 +2728,7 @@ async function compareRagAnswers(event) {
   event.preventDefault();
   if (!activeConversation) { ui.ragCompareMessage.textContent = "Сначала создайте или откройте диалог."; return; }
   ui.ragCompareSubmit.disabled = true;
-  ui.ragCompareMessage.textContent = "Выполняются два последовательных запроса DeepSeek…";
+  ui.ragCompareMessage.textContent = "Выполняются два последовательных запроса выбранной модели…";
   try {
     const data = await api(`/api/conversations/${activeConversation.id}/rag-compare`, { method: "POST", body: {
       question_id: ui.ragControlQuestion.value || null,
@@ -2733,7 +2795,7 @@ async function compareRagPipelines(event) {
   event.preventDefault();
   if (!activeConversation) { ui.ragPipelineMessage.textContent = "Сначала создайте или откройте диалог."; return; }
   ui.ragPipelineSubmit.disabled = true;
-  ui.ragPipelineMessage.textContent = "Выполняются query rewrite, локальный reranking и пять ответов DeepSeek…";
+  ui.ragPipelineMessage.textContent = "Выполняются query rewrite, локальный reranking и пять ответов выбранной модели…";
   try {
     const data = await api(`/api/conversations/${activeConversation.id}/rag-pipeline-compare`, { method: "POST", body: {
       question_id: ui.ragPipelineQuestion.value || null,
@@ -2877,6 +2939,7 @@ ui.newProject.addEventListener("click", () => { ui.newProjectForm.hidden = false
 ui.newProjectCancel.addEventListener("click", () => { ui.newProjectForm.hidden = true; ui.newProjectName.value = ""; });
 ui.newProjectForm.addEventListener("submit", (event) => createSidebarProject(event).catch(showError));
 ui.form.addEventListener("submit", submitMessage); ui.input.addEventListener("input", resizeInput);
+ui.voiceEnabled.addEventListener("change", toggleVoiceService);
 ui.voiceButton.addEventListener("click", toggleVoiceRecording);
 ui.mcpDisableAll.addEventListener("click", () => setMcpControl(false));
 ui.mcpEnableAll.addEventListener("click", () => setMcpControl(true));
@@ -2949,4 +3012,7 @@ ui.presetSelect.addEventListener("change", () => {
 ui.resetCustom.addEventListener("click", () => { selectedPresetId = ""; ui.presetSelect.value = ""; applySettings(appState.defaults); });
 ui.saveAsPreset.addEventListener("click", () => openPresetDialog(true)); ui.presetsButton.addEventListener("click", () => openPresetDialog());
 ui.presetSave.addEventListener("click", savePreset); ui.presetCancelEdit.addEventListener("click", clearPresetEditor);
-document.querySelectorAll("#settings-panel input, #settings-panel textarea, #settings-panel select").forEach((control) => control.addEventListener("input", updateSettingsSummary));
+document.querySelectorAll("#settings-panel input, #settings-panel textarea, #settings-panel select").forEach((control) => control.addEventListener("input", () => {
+  updateSettingsSummary();
+  if (control === ui.model) renderTokenOverview();
+}));

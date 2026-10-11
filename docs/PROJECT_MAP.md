@@ -1,4 +1,4 @@
-# Карта проекта DeepSeek Agent
+# Карта проекта Local LLM Agent
 
 Этот файл предназначен для быстрого входа Codex в проект. Он описывает границы
 модулей и направляет к нужным исходникам, но не заменяет проверку актуального
@@ -13,7 +13,8 @@
 
 ## Технологии и запуск
 
-- Python 3.10+, Flask, OpenAI Python SDK с `base_url=https://api.deepseek.com`.
+- Python 3.10+, Flask, OpenAI Python SDK с двумя OpenAI-compatible адресами:
+  локальная LM Studio `http://127.0.0.1:1234/v1` и официальный DeepSeek API.
 - Клиентская часть — обычные HTML, CSS и JavaScript без сборщика.
 - Постоянное хранилище — локальные UTF-8 JSON-файлы и SQLite для Scheduler.
 - Документальный индекс — отдельный SQLite, локальная CPU-модель multilingual-e5-small и два вида chunking.
@@ -28,7 +29,7 @@
 
 | Файл | Ответственность | Открывать при изменении |
 | --- | --- | --- |
-| `agent.py` | `AgentSettings`, абстракция `ChatProvider`, DeepSeek-адаптер, сбор `usage`, основной ответ, summary и извлечение facts | Модели, параметры, провайдер, промпты памяти, токены |
+| `agent.py` | `AgentSettings`, абстракция `ChatProvider`, адаптеры LM Studio/DeepSeek, маршрутизация по model-id, сбор `usage`, основной ответ, summary и извлечение facts | Модели, параметры, провайдер, промпты памяти, токены |
 | `context_manager.py` | Четыре стратегии контекста, активный путь дерева, summary-ревизии, Sticky Facts и операции ветвления | Контекст, память, facts, ветки |
 | `memory_manager.py` | Профили, схемы памяти, CRUD, валидация, отбор, снимки и маршрутизация project/user | Иерархическая память и персонализация |
 | `task_memory.py` | Независимый снимок цели диалога, уточнений, ограничений, терминов, решений и открытых вопросов | Память задачи Дня 25 |
@@ -47,7 +48,7 @@
 | `presets.py` | CRUD, проверка и импорт пресетов | Пресеты |
 | `voice.py` | Единый локальный whisper-server, межпроцессный runtime-реестр, PID/порт, статус и транскрибация | Голосовой ввод |
 | `logging_setup.py` | Ротационные журналы, request ID и маскирование секретов | Логирование |
-| `main.py` | Выбор порта, запуск, открытие браузера, остановка Whisper | Запуск приложения |
+| `main.py` | Выбор порта, запуск, открытие браузера; Whisper включается пользователем отдельно | Запуск приложения |
 | `templates/index.html` | DOM-каркас чата и панелей | Элементы интерфейса |
 | `static/app.js` | Состояние клиента, вызовы API и отрисовка | Поведение интерфейса |
 | `static/style.css` | Внешний вид интерфейса | Стили |
@@ -68,9 +69,9 @@ static/app.js
   -> context_manager.py: update facts or summary when their mode is active
   -> context_manager.py: construct history for the current stage_run_id on the active tree path
   -> agent.py: add policy, profile, task memory, optional task state, active handoff, user/project memory, summary/facts, history and new message
-  -> DeepSeekProvider.complete() или цикл complete_with_tools()
-       → MediaWiki / World Bank / Open‑Meteo / Scheduler MCP → DeepSeek
-       → при явном файловом экспорте: Open‑Meteo → DeepSeek → Filesystem write_file
+  -> RoutingProvider: LMStudioProvider или DeepSeekProvider
+       → MediaWiki / World Bank / Open‑Meteo / Scheduler MCP → выбранная модель
+       → при явном файловом экспорте: Open‑Meteo → выбранная модель → Filesystem write_file
   -> app.py: attach exact usage and settings snapshots, save assistant message
   -> task_memory.py: after a successful exchange, validate and save the next task-memory snapshot when enabled
   -> storage.py: atomic JSON replacement
@@ -446,6 +447,7 @@ LLM-вызова оставляет исходную задачу на `validati
 | `POST/PUT/DELETE /api/presets[/<preset_id>]` | CRUD пресетов |
 | `GET /api/voice/status` | Статус локального Whisper, включая PID, порт и признак переиспользования |
 | `POST /api/voice/start` | Запуск Whisper |
+| `POST /api/voice/stop` | Отключение Whisper для текущего приложения |
 | `POST /api/voice/transcribe` | Локальная транскрибация аудио |
 | `GET /api/mcp-control` | Состояние постоянного общего выключателя MCP |
 | `POST /api/mcp-control/disable` | Сохранить блокировку и остановить все MCP |

@@ -69,6 +69,7 @@ def build_stage_handoff(
     *,
     target_stage: str,
     event: str,
+    model: str | None = None,
 ) -> dict[str, Any]:
     """Создаёт неизменяемый handoff до мутации этапа."""
     state = deepcopy(ensure_task_state(conversation))
@@ -76,6 +77,7 @@ def build_stage_handoff(
     source_ids = [str(item.get("exchange_id")) for item in exchanges if item.get("exchange_id")]
     active_before = active_task_handoffs(conversation)
     if exchanges:
+        handoff_kwargs = {"model": model} if model else {}
         result = agent.extract_stage_handoff(
             source_stage=state["stage"],
             target_stage=target_stage,
@@ -84,6 +86,7 @@ def build_stage_handoff(
             previous_handoffs=active_before,
             exchanges=exchanges,
             max_transcript_chars=MAX_TRANSCRIPT_CHARS,
+            **handoff_kwargs,
         )
         payload = _parse_payload(result.content)
         technical = {

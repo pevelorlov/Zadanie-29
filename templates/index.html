@@ -3,14 +3,14 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="Локальный многодиалоговый агент DeepSeek">
-  <title>DeepSeek Agent</title>
+  <meta name="description" content="Многодиалоговый агент с локальной LM Studio и DeepSeek">
+  <title>Local LLM Agent</title>
   <link rel="stylesheet" href="{{ url_for('static', filename='style.css', v='20261003-day23') }}">
 </head>
 <body>
   <div class="app-shell">
     <aside class="sidebar">
-      <div class="brand"><span class="brand-mark">D</span><div><strong>DeepSeek Agent</strong><small>Локальная история JSON</small></div></div>
+      <div class="brand"><span class="brand-mark">L</span><div><strong>Local LLM Agent</strong><small>LM Studio или DeepSeek</small></div></div>
       <div class="profile-switcher">
         <label>Активный профиль<select id="profile-select" aria-label="Активный профиль"></select></label>
         <button id="profile-edit" class="icon-button" type="button" title="Изменить активный профиль">✎</button>
@@ -45,7 +45,7 @@
       <header class="chat-header">
         <div>
           <input id="chat-title" class="title-input" value="Новый диалог" maxlength="120" aria-label="Название диалога">
-          <div id="chat-subtitle" class="subtitle">DeepSeek · история сохраняется автоматически</div>
+          <div id="chat-subtitle" class="subtitle">LM Studio / DeepSeek · история сохраняется автоматически</div>
           <div id="token-overview" class="token-overview" aria-label="Накопленные токены диалога" hidden></div>
         </div>
         <div class="header-actions">
@@ -78,16 +78,19 @@
           <label class="rag-chat-option">До<input id="chat-rag-candidate-k" type="number" min="1" max="100" value="20"></label>
           <label class="rag-chat-option">После<input id="chat-rag-final-k" type="number" min="1" max="20" value="5"></label>
           <label class="rag-chat-option">Порог<input id="chat-rag-threshold" type="number" min="-1" max="1" step="0.01" value="0.83"></label>
-          <span id="request-status" class="request-status" role="status" hidden><i></i> Запрос отправлен · ожидаем DeepSeek</span>
+          <span id="request-status" class="request-status" role="status" hidden><i></i> Запрос отправлен · ожидаем модель</span>
         </div>
         <form id="message-form" class="composer">
           <textarea id="message-input" maxlength="50000" rows="1" placeholder="Напишите сообщение…"></textarea>
+          <label class="voice-toggle" title="Загрузить или выгрузить локальный Whisper">
+            <input id="voice-enabled" type="checkbox"><span>Whisper</span>
+          </label>
           <button id="voice-button" class="voice-button" type="button" title="Надиктовать сообщение" aria-label="Надиктовать сообщение" disabled>
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 15a3 3 0 0 0 3-3V6a3 3 0 1 0-6 0v6a3 3 0 0 0 3 3Zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V22h2v-3.08A7 7 0 0 0 19 12h-2Z"/></svg>
           </button>
           <button id="send-button" class="send-button" type="submit" title="Отправить">↑</button>
         </form>
-        <div class="composer-foot"><span><span id="voice-status" class="voice-status">Whisper запускается…</span><span id="form-error" role="alert"></span></span><span>Enter — отправить · Shift+Enter — новая строка</span></div>
+        <div class="composer-foot"><span><span id="voice-status" class="voice-status">Whisper выключен.</span><span id="form-error" role="alert"></span></span><span>Enter — отправить · Shift+Enter — новая строка</span></div>
       </section>
     </main>
 
@@ -144,7 +147,7 @@
             <div><small>ДЕНЬ 17</small><h3 id="weather-mcp-title">Open‑Meteo MCP</h3></div>
             <span id="weather-mcp-status" class="mcp-status stopped">Остановлен</span>
           </div>
-          <small>Пять погодных инструментов передаются DeepSeek. После запуска можно спросить в чате о погоде и подходящей одежде.</small>
+          <small>Пять погодных инструментов передаются выбранной модели. После запуска можно спросить в чате о погоде и подходящей одежде.</small>
           <div class="mcp-actions">
             <button id="weather-mcp-start" class="primary" type="button">Запустить MCP</button>
             <button id="weather-mcp-tools" class="secondary" type="button" disabled>Получить инструменты</button>
@@ -313,7 +316,7 @@
 
     <main id="rag-panel" class="rag-panel" hidden>
       <header class="rag-header">
-        <div><small>ДЕНЬ 21</small><h1>Индексация документов</h1><p>Локальные чанки, эмбеддинги и сравнительный поиск без вызова DeepSeek.</p></div>
+        <div><small>ДЕНЬ 21</small><h1>Индексация документов</h1><p>Локальные чанки, эмбеддинги и сравнительный поиск без вызова LLM.</p></div>
         <span id="rag-header-status" class="rag-status idle">Индекс не построен</span>
       </header>
       <div class="rag-scroll">
@@ -361,7 +364,7 @@
         </section>
 
         <section class="rag-card rag-search-card">
-          <div class="rag-card-heading"><div><small>СЕМАНТИЧЕСКИЙ ПОИСК</small><h2>Сравнить два индекса</h2></div><span>DeepSeek не вызывается</span></div>
+          <div class="rag-card-heading"><div><small>СЕМАНТИЧЕСКИЙ ПОИСК</small><h2>Сравнить два индекса</h2></div><span>LLM не вызывается</span></div>
           <form id="rag-search-form" class="rag-search-form">
             <input id="rag-search-query" maxlength="2000" placeholder="Введите вопрос или поисковую фразу" required>
             <label>Top-K<input id="rag-search-top-k" type="number" min="1" max="50" value="5"></label>
@@ -372,7 +375,7 @@
         </section>
 
         <section class="rag-card rag-answer-card">
-          <div class="rag-card-heading"><div><small>ДЕНЬ 22</small><h2>Ответ без RAG и с RAG</h2></div><span>2 вызова DeepSeek</span></div>
+          <div class="rag-card-heading"><div><small>ДЕНЬ 22</small><h2>Ответ без RAG и с RAG</h2></div><span>2 вызова выбранной модели</span></div>
           <p class="rag-help">Сравнение не добавляет сообщения в диалог. Настройки модели и текущий контекст берутся из активного диалога, результат сохраняется отдельно.</p>
           <form id="rag-compare-form" class="rag-compare-form">
             <label>Контрольный вопрос<select id="rag-control-question"><option value="">Свой вопрос</option></select></label>
@@ -414,7 +417,7 @@
 
         <section class="rag-card rag-answer-card rag-day24-card">
           <div class="rag-card-heading"><div><small>ДЕНЬ 24</small><h2>Источники, цитаты и «не знаю»</h2></div><span>ответ + LLM-проверка</span></div>
-          <p class="rag-help">Combined-поиск сначала проходит локальный порог. При слабой релевантности DeepSeek для ответа не вызывается. Иначе приложение проверяет source, section, chunk_id и дословность каждой цитаты, затем отдельный LLM-вызов оценивает смысловую подтверждённость.</p>
+          <p class="rag-help">Combined-поиск сначала проходит локальный порог. При слабой релевантности модель для ответа не вызывается. Иначе приложение проверяет source, section, chunk_id и дословность каждой цитаты, затем отдельный LLM-вызов оценивает смысловую подтверждённость.</p>
           <form id="rag-evidence-form" class="rag-compare-form">
             <label>Контрольный вопрос<select id="rag-evidence-question"><option value="">Свой вопрос</option></select></label>
             <textarea id="rag-evidence-text" maxlength="50000" rows="4" placeholder="Введите вопрос для проверяемого RAG" required></textarea>
@@ -617,7 +620,7 @@
       </div>
       <div class="scheduler-layout">
         <section class="scheduler-editor">
-          <div class="section-title"><strong id="scheduler-editor-title">Новое задание</strong><small>DeepSeek вызывается автоматически</small></div>
+          <div class="section-title"><strong id="scheduler-editor-title">Новое задание</strong><small>Выбранная модель вызывается автоматически</small></div>
           <input id="scheduler-edit-id" type="hidden">
           <label>Название<input id="scheduler-task-title" maxlength="160" placeholder="Утренняя погода"></label>
           <label>Промпт<textarea id="scheduler-task-prompt" maxlength="50000" rows="5" placeholder="Получи погоду в Новосибирске и предложи одежду."></textarea></label>
@@ -643,7 +646,7 @@
               <label><input type="checkbox" value="get_precipitation_window"> get_precipitation_window</label>
             </div>
           </fieldset>
-          <p class="scheduler-cost-note">Периодические задания выполняют платные запросы DeepSeek. Минимальный период — 5 минут. Пропущенные запуски не догоняются.</p>
+          <p class="scheduler-cost-note">Периодические задания вызывают выбранную модель; DeepSeek может расходовать API-средства. Минимальный период — 5 минут. Пропущенные запуски не догоняются.</p>
           <p id="scheduler-error" class="form-error" role="alert"></p>
           <div class="dialog-actions">
             <button id="scheduler-reset" class="secondary" type="button">Очистить</button>

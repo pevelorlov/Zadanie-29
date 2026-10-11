@@ -14,10 +14,13 @@ from types import SimpleNamespace
 
 from agent import (
     DEEPSEEK_CONTEXT_WINDOWS,
+    LM_STUDIO_CONTEXT_WINDOWS,
     Agent,
     AgentResult,
     AgentSettings,
     DeepSeekProvider,
+    LMStudioProvider,
+    RoutingProvider,
     dialogue_token_totals,
 )
 from artifacts import ArtifactError, extract_artifact_payloads, normalize_artifact_path
@@ -329,6 +332,18 @@ class ExtractionFailProvider(FakeProvider):
         return super().complete(messages, settings)
 
 
+class RagRepairFailProvider(FakeProvider):
+    def complete(self, messages, settings):
+        system = messages[0]["content"]
+        if "исправляешь проверяемый RAG-ответ" in system:
+            self.calls.append((messages, settings))
+            raise RuntimeError("local structured generation exhausted")
+        if "ПРОВЕРЯЕМЫЙ RAG" in system:
+            base = super().complete(messages, settings)
+            return AgentResult("Ответ без JSON-контракта", "", base.technical)
+        return super().complete(messages, settings)
+
+
 class ProfileAwareProvider(FakeProvider):
     def complete(self, messages, settings):
         result = super().complete(messages, settings)
@@ -511,6 +526,7 @@ class FinalCompletionFailProvider(ArtifactLifecycleProvider):
 class FakeVoiceService:
     def __init__(self):
         self.started = False
+        self.stopped = False
         self.received = None
 
     def status(self):
@@ -528,7 +544,7 @@ class FakeVoiceService:
         return {"text": "Распознанный текст", "language": "ru"}
 
     def stop(self):
-        pass
+        self.stopped = True
 
 
 class FakeMCPManager:
@@ -713,6 +729,98 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(result.technical["usage"]["total_tokens"], 20)
         self.assertIn("elapsed_seconds", result.technical)
 
+    def test_lm_studio_provider_uses_local_compatible_request(self):
+        usage = SimpleNamespace(
+            prompt_tokens=7, completion_tokens=9, total_tokens=16,
+            completion_tokens_details=SimpleNamespace(reasoning_tokens=4),
+        )
+        message = SimpleNamespace(content="Локальный ответ", reasoning_content="Локальное рассуждение")
+        response = SimpleNamespace(
+            id="local-1", model="ornith-1.5-9b", system_fingerprint="ornith-1.5-9b",
+            usage=usage, choices=[SimpleNamespace(message=message, finish_reason="stop")],
+        )
+        requests = []
+        client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(
+            create=lambda **kwargs: requests.append(kwargs) or response,
+        )))
+
+        result = LMStudioProvider(client).complete(
+            [{"role": "user", "content": "Привет"}], AgentSettings(model="ornith-1.5-9b"),
+        )
+
+        self.assertEqual(result.content, "Локальный ответ")
+        self.assertEqual(result.technical["provider"], "lm_studio")
+        self.assertEqual(result.technical["usage"]["reasoning_tokens"], 4)
+        self.assertEqual(requests[0]["max_tokens"], 4096)
+        self.assertNotIn("extra_body", requests[0])
+
+    def test_lm_studio_provider_maps_json_object_to_supported_schema(self):
+        provider = LMStudioProvider(SimpleNamespace())
+
+        request = provider._request_args(
+            [{"role": "user", "content": "Верни JSON"}],
+            AgentSettings(model="ornith-1.5-9b", response_format="json_object"),
+        )
+
+        self.assertEqual(request["response_format"]["type"], "json_schema")
+        self.assertEqual(
+            request["response_format"]["json_schema"]["schema"]["type"], "object",
+        )
+        self.assertEqual(request["max_tokens"], 4096)
+
+    def test_lm_studio_provider_waits_up_to_thirty_minutes_by_default(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("LM_STUDIO_TIMEOUT", None)
+            with mock.patch("agent.OpenAI") as client_constructor:
+                LMStudioProvider()._get_client()
+
+        self.assertEqual(client_constructor.call_args.kwargs["timeout"], 1800.0)
+
+    def test_routing_provider_selects_provider_by_model(self):
+        local = FakeProvider()
+        cloud = FakeProvider()
+        router = RoutingProvider(local, cloud)
+
+        messages = [{"role": "system", "content": "Тест"}]
+        router.complete(messages, AgentSettings(model="ornith-1.5-9b"))
+        router.complete(messages, AgentSettings(model="qwen3.8-2b-distill"))
+        router.complete(messages, AgentSettings(model="deepseek-v4-flash"))
+
+        self.assertEqual(len(local.calls), 2)
+        self.assertEqual(local.calls[1][1].model, "qwen3.8-2b-distill")
+        self.assertEqual(len(cloud.calls), 1)
+
+    def test_auxiliary_operations_inherit_selected_model(self):
+        provider = FakeProvider()
+        agent = Agent(provider)
+        model = "qwen3.8-2b-distill"
+
+        agent.extract_memories(
+            "Сообщение", "Ответ", allow_project=False, allow_user=True, model=model,
+        )
+        agent.update_task_memory({}, "Сообщение", "Ответ", model=model)
+        agent.extract_project_memories_from_history(
+            [{"role": "user", "content": "Требование"}], model=model,
+        )
+        agent.extract_facts([], "Сообщение", model=model)
+        agent.summarize("", [{"messages": [
+            {"role": "user", "content": "Сообщение"},
+            {"role": "assistant", "content": "Ответ"},
+        ]}], model=model)
+        agent.extract_stage_handoff(
+            model=model,
+            source_stage="planning",
+            target_stage="execution",
+            event="approve_plan",
+            task_state={"description": "Тест", "stage": "planning"},
+            previous_handoffs=[],
+            exchanges=[{"messages": [{"role": "user", "content": "План утверждён"}]}],
+            max_transcript_chars=10_000,
+        )
+
+        self.assertEqual(len(provider.calls), 6)
+        self.assertTrue(all(call[1].model == model for call in provider.calls))
+
     def test_deepseek_provider_calls_mcp_tool_and_uses_result(self):
         class ToolCall:
             id = "call-weather"
@@ -835,6 +943,8 @@ class AgentTests(unittest.TestCase):
     def test_supported_models_publish_one_million_token_context_windows(self):
         self.assertEqual(DEEPSEEK_CONTEXT_WINDOWS["deepseek-v4-flash"], 1_000_000)
         self.assertEqual(DEEPSEEK_CONTEXT_WINDOWS["deepseek-v4-pro"], 1_000_000)
+        self.assertEqual(LM_STUDIO_CONTEXT_WINDOWS["ornith-1.5-9b"], 32_768)
+        self.assertEqual(LM_STUDIO_CONTEXT_WINDOWS["qwen3.8-2b-distill"], 86_528)
 
     def test_summary_is_injected_into_system_prompt(self):
         provider = FakeProvider()
@@ -1129,6 +1239,17 @@ class WhisperLifecycleTests(unittest.TestCase):
             ):
                 self.assertEqual(service._find_reusable_server(), 4321)
 
+    def test_ready_whisper_from_another_project_is_reused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = self.make_service(Path(directory))
+            with (
+                mock.patch.object(service, "_listener_pid", return_value=17240),
+                mock.patch.object(service, "_process_path", return_value=r"C:\other-project\whisper-server.exe"),
+                mock.patch.object(service, "_pid_running", return_value=True),
+                mock.patch.object(service, "_server_is_ready", return_value=True),
+            ):
+                self.assertEqual(service._find_reusable_server(), 17240)
+
     def test_foreign_listener_blocks_second_whisper(self):
         with tempfile.TemporaryDirectory() as directory:
             service = self.make_service(Path(directory))
@@ -1279,12 +1400,13 @@ class ApiTests(unittest.TestCase):
 
     def test_index_is_chat_not_temperature_lab(self):
         text = self.client.get("/").get_data(as_text=True)
-        self.assertIn("DeepSeek Agent", text)
+        self.assertIn("Local LLM Agent", text)
         self.assertIn("Новый диалог", text)
         self.assertIn("Нет — выключен", text)
         self.assertIn("Да — включён", text)
-        self.assertIn("Запрос отправлен · ожидаем DeepSeek", text)
+        self.assertIn("Запрос отправлен · ожидаем модель", text)
         self.assertIn("Надиктовать сообщение", text)
+        self.assertIn('id="voice-enabled"', text)
         self.assertNotIn('<option value="branching">', text)
         self.assertIn("Ветвление доступно во всех режимах", text)
         self.assertIn('id="facts-help-button"', text)
@@ -1565,7 +1687,7 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         routing = response.get_json()["conversation"]["visible_messages"][-1]["technical"]["rag"]["routing"]
         self.assertEqual(routing["route"], "rag")
-        self.assertEqual(routing["classifier"], "deepseek")
+        self.assertEqual(routing["classifier"], "llm")
         classifier_calls = [
             call for call in provider.calls
             if "маршрутизатор production-like чата" in call[0][0]["content"]
@@ -1721,6 +1843,36 @@ class ApiTests(unittest.TestCase):
         self.assertNotIn("text", assistant["technical"]["rag"]["chunks"][0])
         self.assertEqual(response.get_json()["conversation"]["rag_evidence_ledger"][0]["chunk_id"], "chunk-test")
 
+    def test_verified_rag_repair_failure_preserves_draft_instead_of_502(self):
+        rag = FakeRagIndexService()
+        provider = RagRepairFailProvider()
+        app = create_app(
+            Path(self.temp.name) / "verified-rag-repair-failure",
+            Agent(provider), self.voice, self.mcp, rag_index_service=rag,
+        )
+        app.config.update(TESTING=True)
+        client = app.test_client()
+        conversation = client.post(
+            "/api/conversations", json={"title": "Ошибка RAG repair"},
+        ).get_json()["conversation"]
+
+        response = client.post(f"/api/conversations/{conversation['id']}/messages", json={
+            "content": "Какой точный факт указан в документе?",
+            "settings": AgentSettings().to_dict(),
+            "rag": {
+                "enabled": True, "verified": True, "strategy": "combined", "mode": "combined",
+                "candidate_k": 20, "final_k": 5, "similarity_threshold": 0.83,
+            },
+        })
+
+        self.assertEqual(response.status_code, 200)
+        assistant = response.get_json()["conversation"]["visible_messages"][-1]
+        self.assertIn("автоматическая проверка цитат не завершена", assistant["content"])
+        self.assertIn("Ответ без JSON-контракта", assistant["content"])
+        self.assertEqual(
+            assistant["technical"]["rag"]["evidence"]["reason"], "model_repair_failed",
+        )
+
     def test_synthesis_rehydrates_verified_evidence_ledger(self):
         rag = FakeRagIndexService()
         provider = FakeProvider()
@@ -1855,9 +2007,45 @@ class ApiTests(unittest.TestCase):
         self.assertIn("reranker_score", evaluation["pipeline_results"]["rerank"]["retrieval"]["chunks"][0])
 
     def test_state_exposes_model_context_windows(self):
-        provider = self.client.get("/api/state").get_json()["provider"]
+        state = self.client.get("/api/state").get_json()
+        provider = state["provider"]
         self.assertEqual(provider["context_windows"]["deepseek-v4-flash"], 1_000_000)
+        self.assertEqual(provider["context_windows"]["ornith-1.5-9b"], 32_768)
+        self.assertEqual(provider["context_windows"]["qwen3.8-2b-distill"], 86_528)
+        self.assertIn("qwen3.8-2b-distill", provider["providers"]["lm_studio"]["models"])
+        self.assertEqual(state["default_settings"]["model"], "ornith-1.5-9b")
         self.assertEqual(provider["context_windows"]["deepseek-v4-pro"], 1_000_000)
+
+    def test_local_preset_routes_message_only_to_lm_studio_provider(self):
+        local = FakeProvider()
+        cloud = FakeProvider()
+        data_dir = Path(self.temp.name) / "local-preset-routing"
+        app = create_app(data_dir, Agent(RoutingProvider(local, cloud)), self.voice, self.mcp)
+        app.config.update(TESTING=True)
+        client = app.test_client()
+        client.post("/api/task-control/disable", json={})
+        preset_response = client.post("/api/presets", json={
+            "name": "Локальный Ornith",
+            "description": "Проверка маршрутизации",
+            "settings": AgentSettings(model="ornith-1.5-9b").to_dict(),
+        })
+        self.assertEqual(preset_response.status_code, 201)
+        preset = preset_response.get_json()["preset"]
+        conversation = client.post("/api/conversations", json={"title": "Локальный пресет"}).get_json()["conversation"]
+
+        response = client.post(f"/api/conversations/{conversation['id']}/messages", json={
+            "content": "Проверка локального маршрута",
+            "preset_id": preset["id"],
+            "settings": preset["settings"],
+            "rag": {"enabled": False},
+        })
+
+        self.assertEqual(response.status_code, 200)
+        self.assertGreaterEqual(len(local.calls), 1)
+        self.assertEqual(cloud.calls, [])
+        assistant = response.get_json()["conversation"]["visible_messages"][-1]
+        self.assertEqual(assistant["technical"]["settings"]["model"], "ornith-1.5-9b")
+        self.assertEqual(assistant["technical"]["configuration_source"]["type"], "preset")
 
     def test_mcp_long_lived_session_lists_tools_and_prevents_duplicate_start(self):
         initial = self.client.get("/api/mcp/status")
@@ -2708,6 +2896,9 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.get_json()["text"], "Распознанный текст")
         self.assertEqual(self.voice.received[0], b"audio-bytes")
+        stopped = self.client.post("/api/voice/stop")
+        self.assertEqual(stopped.status_code, 200)
+        self.assertTrue(self.voice.stopped)
 
     def test_voice_send_button_requests_immediate_transcription_delivery(self):
         script = (Path(__file__).parent / "static" / "app.js").read_text(encoding="utf-8")
@@ -2770,7 +2961,7 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(summary["covered_exchange_count"], 5)
         self.assertEqual(len(summary["source_exchange_ids"]), 5)
         self.assertEqual(len(summary["source_message_ids"]), 10)
-        self.assertEqual(summary["technical"]["settings"]["model"], "deepseek-v4-flash")
+        self.assertEqual(summary["technical"]["settings"]["model"], "ornith-1.5-9b")
         self.assertFalse(summary["technical"]["settings"]["reasoning_enabled"])
         self.assertEqual(result["summary_token_totals"]["total_tokens"], 30)
 

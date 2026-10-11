@@ -1,4 +1,4 @@
-"""Flask API для многодиалогового DeepSeek Agent."""
+"""Flask API для многодиалогового агента с LM Studio и DeepSeek."""
 
 from __future__ import annotations
 
@@ -33,12 +33,13 @@ from artifacts import (
 )
 
 from agent import (
-    DEEPSEEK_MODELS,
+    DEFAULT_MODEL,
     PROVIDER_CAPABILITIES,
+    SUPPORTED_MODELS,
     Agent,
     AgentResult,
     AgentSettings,
-    DeepSeekProvider,
+    RoutingProvider,
     dialogue_token_totals,
     normalize_token_usage,
 )
@@ -396,10 +397,10 @@ def create_app(
     flask_app.config["MAX_CONTENT_LENGTH"] = 26 * 1024 * 1024
     storage = JsonStorage(data_dir or BASE_DIR / "data")
     preset_manager = PresetManager(storage)
-    chat_agent = agent_instance or Agent(DeepSeekProvider())
+    chat_agent = agent_instance or Agent(RoutingProvider())
     memory_manager = MemoryManager(storage, BASE_DIR / "config" / "agent_policy.json")
     invariant_store = InvariantStore(storage.data_dir)
-    whisper = voice_service or WhisperService(BASE_DIR, autostart=data_dir is None)
+    whisper = voice_service or WhisperService(BASE_DIR, autostart=False)
     mcp = mcp_manager or MCPManager(BASE_DIR)
     weather_mcp = weather_mcp_manager or OpenMeteoMCPManager(BASE_DIR)
     scheduler_repository = (
@@ -461,7 +462,7 @@ def create_app(
         result = chat_agent.rewrite_rag_query(question, settings, retrieval_context)
         value = " ".join(str(result.content or "").strip().strip('"').split())
         if not value:
-            raise RuntimeError("DeepSeek не вернул поисковую формулировку.")
+            raise RuntimeError("Модель не вернула поисковую формулировку.")
         return value[:2_000], {
             "query": value[:2_000],
             "technical": deepcopy(result.technical),
@@ -597,7 +598,7 @@ def create_app(
                 "route": route,
                 "confidence": confidence,
                 "reason": str(value.get("reason") or "llm_classifier")[:500],
-                "classifier": "deepseek",
+                "classifier": "llm",
                 "technical": deepcopy(result.technical),
             }
         except Exception as error:
@@ -778,37 +779,59 @@ def create_app(
         try:
             content, evidence = validate_and_format_evidence(draft.content, retrieval)
             if evidence.get("status") == "unknown" and retrieval.get("chunks"):
-                repair_result = chat_agent.repair_rag_evidence(
-                    retry_unknown_prompt(question, draft.content, retrieval), settings
-                )
                 try:
-                    retry_content, retry_evidence = validate_and_format_evidence(
-                        repair_result.content, retrieval,
+                    repair_result = chat_agent.repair_rag_evidence(
+                        retry_unknown_prompt(question, draft.content, retrieval), settings
                     )
-                    if retry_evidence.get("status") == "answer":
-                        content, evidence = retry_content, retry_evidence
-                    else:
-                        evidence["retry_reason"] = "model_confirmed_unknown"
-                except EvidenceValidationError as retry_error:
-                    evidence["retry_reason"] = "unknown_retry_invalid"
-                    evidence["retry_error"] = str(retry_error)
+                    try:
+                        retry_content, retry_evidence = validate_and_format_evidence(
+                            repair_result.content, retrieval,
+                        )
+                        if retry_evidence.get("status") == "answer":
+                            content, evidence = retry_content, retry_evidence
+                        else:
+                            evidence["retry_reason"] = "model_confirmed_unknown"
+                    except EvidenceValidationError as retry_error:
+                        evidence["retry_reason"] = "unknown_retry_invalid"
+                        evidence["retry_error"] = str(retry_error)
+                except Exception as repair_error:
+                    logger.warning(
+                        "RAG-исправление не выполнено | error=%s",
+                        type(repair_error).__name__,
+                    )
+                    evidence["retry_reason"] = "model_repair_failed"
+                    evidence["retry_error"] = str(repair_error)
         except EvidenceValidationError as error:
             first_error = str(error)
-            repair_result = chat_agent.repair_rag_evidence(
-                repair_prompt(question, draft.content, retrieval, first_error), settings
-            )
             try:
+                repair_result = chat_agent.repair_rag_evidence(
+                    repair_prompt(question, draft.content, retrieval, first_error), settings
+                )
                 content, evidence = validate_and_format_evidence(repair_result.content, retrieval)
-            except EvidenceValidationError as repair_error:
-                content = RAG_UNSUPPORTED_RESPONSE
+            except Exception as repair_error:
+                logger.warning(
+                    "RAG-исправление завершилось ошибкой | error=%s",
+                    type(repair_error).__name__,
+                )
+                # Основная модель уже завершила ответ. Сбой дополнительной
+                # проверки не должен превращать весь пользовательский запрос
+                # в 502 и скрывать готовый текст. Показываем исходный ответ,
+                # но явно не объявляем его проверенным по цитатам.
+                content = (
+                    "Ответ модели получен, но автоматическая проверка цитат "
+                    "не завершена. Ниже показан исходный непроверенный ответ.\n\n"
+                    + str(draft.content or "").strip()
+                )
                 evidence = {
-                    "status": "unknown",
+                    "status": "unverified",
                     "valid": False,
                     "sources_present": False,
                     "quotes_present": False,
                     "citations": [],
                     "errors": [first_error, str(repair_error)],
-                    "reason": "citation_validation_failed",
+                    "reason": "citation_validation_failed" if isinstance(
+                        repair_error, EvidenceValidationError,
+                    ) else "model_repair_failed",
                 }
         technical = deepcopy(draft.technical)
         technical["evidence"] = evidence
@@ -1539,9 +1562,9 @@ def create_app(
 
     @flask_app.get("/api/state")
     def state():
-        default_model = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
-        if default_model not in DEEPSEEK_MODELS:
-            default_model = "deepseek-v4-flash"
+        default_model = os.getenv("APP_DEFAULT_MODEL", os.getenv("LM_STUDIO_MODEL", DEFAULT_MODEL))
+        if default_model not in SUPPORTED_MODELS:
+            default_model = DEFAULT_MODEL
         profile_id = current_profile_id()
         return jsonify({
             "ok": True,
@@ -1902,6 +1925,11 @@ def create_app(
     def voice_start():
         whisper.start()
         return jsonify({"ok": True, "voice": whisper.status()}), 202
+
+    @flask_app.post("/api/voice/stop")
+    def voice_stop():
+        whisper.stop()
+        return jsonify({"ok": True, "voice": whisper.status()})
 
     @flask_app.post("/api/voice/transcribe")
     def voice_transcribe():
@@ -2325,8 +2353,18 @@ def create_app(
             target = ensure_task_state(preview)
             handoff = None
             if before["stage"] != target["stage"]:
+                previous_configuration = last_configuration(active_path_messages(conversation))
+                handoff_model = (
+                    AgentSettings.from_dict(previous_configuration["settings"]).model
+                    if previous_configuration and isinstance(previous_configuration.get("settings"), dict)
+                    else DEFAULT_MODEL
+                )
                 handoff = build_stage_handoff(
-                    conversation, chat_agent, target_stage=target["stage"], event=str(event),
+                    conversation,
+                    chat_agent,
+                    target_stage=target["stage"],
+                    event=str(event),
+                    model=handoff_model,
                 )
             if handoff:
                 activate_stage_handoff(preview, handoff)
@@ -2424,7 +2462,15 @@ def create_app(
                 for message in exchange.get("messages", [])
             ]
             extraction_id = uuid.uuid4().hex
-            result = chat_agent.extract_project_memories_from_history(successful_messages)
+            previous_configuration = last_configuration(path)
+            extraction_model = (
+                AgentSettings.from_dict(previous_configuration["settings"]).model
+                if previous_configuration and isinstance(previous_configuration.get("settings"), dict)
+                else DEFAULT_MODEL
+            )
+            result = chat_agent.extract_project_memories_from_history(
+                successful_messages, model=extraction_model,
+            )
             revision = memory_manager.route_candidates(
                 result, conversation, extraction_id, force_scopes={"project"},
             )
@@ -2847,8 +2893,19 @@ def create_app(
                 strict_evidence
                 and not (retrieval or {}).get("chunks")
             )
-            update_sticky_facts(conversation, chat_agent, content, stage_scoped=task_control_enabled)
-            update_summaries(conversation, chat_agent, stage_scoped=task_control_enabled)
+            update_sticky_facts(
+                conversation,
+                chat_agent,
+                content,
+                stage_scoped=task_control_enabled,
+                model=settings.model,
+            )
+            update_summaries(
+                conversation,
+                chat_agent,
+                stage_scoped=task_control_enabled,
+                model=settings.model,
+            )
             history_for_request, active_summary_text, active_facts, context_snapshot = request_history(
                 conversation, stage_scoped=task_control_enabled,
             )
@@ -3083,7 +3140,10 @@ def create_app(
             if request_status == "completed" and task_memory_snapshot.get("enabled"):
                 try:
                     task_memory_result = chat_agent.update_task_memory(
-                        task_memory_snapshot, content, result.content,
+                        task_memory_snapshot,
+                        content,
+                        result.content,
+                        model=settings.model,
                     )
                     apply_task_memory_result(conversation, task_memory_result, exchange_id)
                 except Exception as task_memory_error:
@@ -3112,7 +3172,11 @@ def create_app(
             ):
                 try:
                     extraction_result = chat_agent.extract_memories(
-                        content, result.content, allow_project=allow_project, allow_user=allow_user,
+                        content,
+                        result.content,
+                        allow_project=allow_project,
+                        allow_user=allow_user,
+                        model=settings.model,
                     )
                     revision = memory_manager.route_candidates(extraction_result, conversation, exchange_id, profile_id=profile_id)
                 except Exception as extraction_error:
@@ -3155,7 +3219,7 @@ def create_app(
             BytesIO(payload),
             mimetype="application/json; charset=utf-8",
             as_attachment=True,
-            download_name=f"deepseek-dialog-{conversation_id[:8]}.json",
+            download_name=f"llm-dialog-{conversation_id[:8]}.json",
         )
 
     @flask_app.get("/api/conversations/<conversation_id>/artifacts/<artifact_id>")
@@ -3226,7 +3290,12 @@ def create_app(
             source = technical.get("configuration_source") or {
                 "type": "custom", "preset_id": None, "preset_name": None,
             }
-            update_summaries(conversation, chat_agent, stage_scoped=task_control_enabled)
+            update_summaries(
+                conversation,
+                chat_agent,
+                stage_scoped=task_control_enabled,
+                model=settings.model,
+            )
             history, summary, facts, snapshot = request_history(conversation, stage_scoped=task_control_enabled)
             profile_id = checkpoint.get("author_profile_id") or conversation.get("owner_profile_id") or current_profile_id()
             memory_snapshot = memory_manager.context_snapshot(conversation, snapshot["mode"], profile_id)
@@ -3300,7 +3369,7 @@ def create_app(
         except (ValueError, KeyError) as error:
             return api_error(str(error).strip("'"), 400)
         except Exception as error:
-            logger.exception("Ошибка DeepSeek API при создании ветки | conversation_id=%s", conversation_id)
+            logger.exception("Ошибка LLM API при создании ветки | conversation_id=%s", conversation_id)
             return api_error(friendly_api_error(error), 502)
 
     @flask_app.patch("/api/conversations/<conversation_id>/branches/active")
@@ -3534,14 +3603,18 @@ def friendly_api_error(error: Exception) -> str:
             "Создайте новый диалог или сократите историю и повторите запрос."
         )
     if "api key" in lowered or "authentication" in lowered or "401" in lowered:
-        return "DeepSeek отклонил API-ключ. Проверьте DEEPSEEK_API_KEY в файле .env."
+        return "Провайдер отклонил API-ключ. Для DeepSeek проверьте DEEPSEEK_API_KEY в файле .env."
     if "429" in lowered or "rate limit" in lowered:
-        return "DeepSeek временно ограничил количество запросов. Попробуйте немного позже."
+        return "Провайдер временно ограничил количество запросов. Попробуйте немного позже."
     if "timeout" in lowered or "timed out" in lowered:
-        return "DeepSeek не успел ответить. Повторите запрос."
+        return "Модель не успела ответить. Повторите запрос."
     if "connection" in lowered or "connect" in lowered or "network" in lowered:
-        return "Не удалось соединиться с DeepSeek. Проверьте интернет, VPN или прокси."
-    return f"Не удалось получить ответ DeepSeek: {text}"
+        return (
+            "Не удалось соединиться с провайдером. Для локальной модели проверьте, "
+            "что LM Studio запущена и сервер слушает 127.0.0.1:1234; для DeepSeek "
+            "проверьте интернет, VPN или прокси."
+        )
+    return f"Не удалось получить ответ модели: {text}"
 
 
 _direct_log_paths = None
@@ -3554,7 +3627,6 @@ app = create_app(voice_service=WhisperService(BASE_DIR, autostart=False), schedu
 
 
 if __name__ == "__main__":
-    app.extensions["whisper_service"].start()
     if app.extensions["mcp_control"].is_enabled():
         app.extensions["scheduler_mcp_manager"].start()
         app.extensions["scheduler_mcp_manager"].list_tools()

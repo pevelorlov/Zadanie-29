@@ -271,7 +271,13 @@ def active_summary(conversation: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
-def update_summaries(conversation: dict[str, Any], agent: Agent, *, stage_scoped: bool = True) -> list[dict[str, Any]]:
+def update_summaries(
+    conversation: dict[str, Any],
+    agent: Agent,
+    *,
+    stage_scoped: bool = True,
+    model: str | None = None,
+) -> list[dict[str, Any]]:
     context = ensure_context_management(conversation)
     if context["mode"] != SUMMARY_MODE:
         return []
@@ -291,7 +297,10 @@ def update_summaries(conversation: dict[str, Any], agent: Agent, *, stage_scoped
             "Обновление summary начато | conversation_id=%s | exchanges=%s | previous=%s",
             conversation.get("id", "-"), len(batch), current.get("id") if current else "-",
         )
-        result = agent.summarize(current.get("content", "") if current else "", batch)
+        summary_kwargs = {"model": model} if model else {}
+        result = agent.summarize(
+            current.get("content", "") if current else "", batch, **summary_kwargs,
+        )
         source_messages = [message for exchange in batch for message in exchange["messages"]]
         new_covered_ids = covered_ids + [exchange["exchange_id"] for exchange in batch]
         revision = {
@@ -350,7 +359,14 @@ def request_history(conversation: dict[str, Any], *, stage_scoped: bool = True) 
     }
 
 
-def update_sticky_facts(conversation: dict[str, Any], agent: Agent, user_text: str, *, stage_scoped: bool = True) -> dict[str, Any] | None:
+def update_sticky_facts(
+    conversation: dict[str, Any],
+    agent: Agent,
+    user_text: str,
+    *,
+    stage_scoped: bool = True,
+    model: str | None = None,
+) -> dict[str, Any] | None:
     context = ensure_context_management(conversation)
     if context["mode"] != FACTS_MODE:
         return None
@@ -363,11 +379,12 @@ def update_sticky_facts(conversation: dict[str, Any], agent: Agent, user_text: s
             "Обновление Sticky Facts начато | conversation_id=%s | current_facts=%s",
             conversation.get("id", "-"), len(current),
         )
-        result = agent.extract_facts(current, user_text)
+        fact_kwargs = {"model": model} if model else {}
+        result = agent.extract_facts(current, user_text, **fact_kwargs)
         parsed = json.loads(result.content)
         raw_facts = parsed.get("facts") if isinstance(parsed, dict) else None
         if not isinstance(raw_facts, list):
-            raise ValueError("DeepSeek не вернул массив facts.")
+            raise ValueError("Модель не вернула массив facts.")
         locked = {item["key"]: item for item in stage_items if item.get("locked") and item.get("key")}
         updated: list[dict[str, Any]] = list(locked.values())
         used_keys = set(locked)

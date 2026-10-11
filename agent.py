@@ -1,4 +1,4 @@
-"""Инкапсулированный агент и провайдер DeepSeek."""
+"""Инкапсулированный агент и провайдеры локальной LM Studio и DeepSeek."""
 
 from __future__ import annotations
 
@@ -22,16 +22,50 @@ DEEPSEEK_MODELS = (
     "deepseek-v4-pro",
 )
 
+LM_STUDIO_MODELS = (
+    "ornith-1.5-9b",
+    "qwen3.8-2b-distill",
+)
+
+SUPPORTED_MODELS = LM_STUDIO_MODELS + DEEPSEEK_MODELS
+DEFAULT_MODEL = LM_STUDIO_MODELS[0]
+
 DEEPSEEK_CONTEXT_WINDOWS = {
     "deepseek-v4-flash": 1_000_000,
     "deepseek-v4-pro": 1_000_000,
 }
 
+LM_STUDIO_CONTEXT_WINDOWS = {
+    "ornith-1.5-9b": 32_768,
+    "qwen3.8-2b-distill": 86_528,
+}
+
+LM_STUDIO_DEFAULT_TIMEOUT_SECONDS = 1_800
+LM_STUDIO_STRUCTURED_MIN_TOKENS = 4_096
+
+LM_STUDIO_JSON_OBJECT_SCHEMA: dict[str, Any] = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "structured_response",
+        "strict": False,
+        "schema": {
+            "type": "object",
+            "additionalProperties": True,
+        },
+    },
+}
+
+MODEL_CONTEXT_WINDOWS = {**LM_STUDIO_CONTEXT_WINDOWS, **DEEPSEEK_CONTEXT_WINDOWS}
+
 
 PROVIDER_CAPABILITIES: dict[str, Any] = {
-    "provider": "deepseek",
-    "models": list(DEEPSEEK_MODELS),
-    "context_windows": DEEPSEEK_CONTEXT_WINDOWS,
+    "provider": "lm_studio_and_deepseek",
+    "providers": {
+        "lm_studio": {"label": "LM Studio (локально)", "models": list(LM_STUDIO_MODELS)},
+        "deepseek": {"label": "DeepSeek (облако)", "models": list(DEEPSEEK_MODELS)},
+    },
+    "models": list(SUPPORTED_MODELS),
+    "context_windows": MODEL_CONTEXT_WINDOWS,
     "controls": {
         "system_prompt": {"type": "text", "max_length": 20_000},
         "temperature": {"type": "number", "min": 0, "max": 2, "step": 0.01},
@@ -50,13 +84,13 @@ PROVIDER_CAPABILITIES: dict[str, Any] = {
 
 @dataclass(frozen=True)
 class AgentSettings:
-    model: str = "deepseek-v4-flash"
+    model: str = DEFAULT_MODEL
     system_prompt: str = "Ты полезный и внимательный ассистент."
     temperature: float = 1.0
     top_p: float = 1.0
     reasoning_enabled: bool = False
     reasoning_effort: str = "high"
-    max_tokens: int | None = None
+    max_tokens: int | None = 4_096
     stop: list[str] = field(default_factory=list)
     response_format: str = "text"
     logprobs: bool = False
@@ -71,8 +105,8 @@ class AgentSettings:
             raise ValueError("Настройки агента должны быть JSON-объектом.")
 
         model = str(value.get("model", cls.model)).strip()
-        if model not in DEEPSEEK_MODELS:
-            raise ValueError("Выбрана неподдерживаемая модель DeepSeek.")
+        if model not in SUPPORTED_MODELS:
+            raise ValueError("Выбрана неподдерживаемая модель.")
 
         system_prompt = str(value.get("system_prompt", cls.system_prompt)).strip()
         if not system_prompt:
@@ -136,6 +170,9 @@ class ChatProvider(Protocol):
 class DeepSeekProvider:
     """Тонкий адаптер DeepSeek. Его можно заменить другим провайдером."""
 
+    provider_name = "deepseek"
+    display_name = "DeepSeek"
+
     def __init__(self, client: OpenAI | None = None) -> None:
         self._client = client
 
@@ -155,7 +192,9 @@ class DeepSeekProvider:
         )
         return self._client
 
-    def complete(self, messages: list[dict[str, str]], settings: AgentSettings) -> AgentResult:
+    def _request_args(
+        self, messages: list[dict[str, Any]], settings: AgentSettings,
+    ) -> dict[str, Any]:
         request_args: dict[str, Any] = {
             "model": settings.model,
             "messages": messages,
@@ -175,20 +214,41 @@ class DeepSeekProvider:
             request_args["stop"] = settings.stop
         if settings.top_logprobs is not None:
             request_args["top_logprobs"] = settings.top_logprobs
+        return request_args
+
+    def _content(self, message: Any, choice: Any, settings: AgentSettings) -> str:
+        content = getattr(message, "content", None) or ""
+        if content.strip():
+            return content
+        finish_reason = getattr(choice, "finish_reason", None)
+        reasoning = getattr(message, "reasoning_content", None) or ""
+        if finish_reason == "length" and reasoning:
+            raise RuntimeError(
+                f"{self.display_name} израсходовал лимит {settings.max_tokens or 'по умолчанию'} "
+                "токенов на рассуждение и не успел сформировать финальный ответ."
+            )
+        raise RuntimeError(f"{self.display_name} вернул пустой ответ.")
+
+    def complete(self, messages: list[dict[str, str]], settings: AgentSettings) -> AgentResult:
+        request_args = self._request_args(messages, settings)
+        effective_format = (request_args.get("response_format") or {}).get(
+            "type", settings.response_format,
+        )
 
         started = time.perf_counter()
         logger.info(
-            "DeepSeek-запрос начат | model=%s | messages=%s | chars=%s | reasoning=%s | format=%s",
+            "%s-запрос начат | model=%s | messages=%s | chars=%s | reasoning=%s | format=%s | max_tokens=%s",
+            self.display_name,
             settings.model, len(messages),
             sum(len(str(item.get("content", ""))) for item in messages),
-            settings.reasoning_enabled, settings.response_format,
+            settings.reasoning_enabled, effective_format, request_args.get("max_tokens"),
         )
         try:
             response = self._get_client().chat.completions.create(**request_args)
         except Exception:
             logger.exception(
-                "DeepSeek-запрос завершился ошибкой | model=%s | elapsed=%.3f",
-                settings.model, time.perf_counter() - started,
+                "%s-запрос завершился ошибкой | model=%s | elapsed=%.3f",
+                self.display_name, settings.model, time.perf_counter() - started,
             )
             raise
         elapsed = time.perf_counter() - started
@@ -198,7 +258,7 @@ class DeepSeekProvider:
         completion_details = getattr(usage, "completion_tokens_details", None)
 
         technical = {
-            "provider": "deepseek",
+            "provider": self.provider_name,
             "request_id": getattr(response, "id", None),
             "model": getattr(response, "model", None) or settings.model,
             "system_fingerprint": getattr(response, "system_fingerprint", None),
@@ -213,15 +273,20 @@ class DeepSeekProvider:
                 "reasoning_tokens": _usage_value(completion_details, "reasoning_tokens"),
             },
             "settings": settings.to_dict(),
+            "effective_request": {
+                "response_format": effective_format,
+                "max_tokens": request_args.get("max_tokens"),
+            },
         }
         logger.info(
-            "DeepSeek-запрос завершён | request_id=%s | model=%s | finish=%s | elapsed=%.3f | input=%s | output=%s | total=%s",
+            "%s-запрос завершён | request_id=%s | model=%s | finish=%s | elapsed=%.3f | input=%s | output=%s | total=%s",
+            self.display_name,
             technical["request_id"], technical["model"], technical["finish_reason"], elapsed,
             technical["usage"]["input_tokens"], technical["usage"]["output_tokens"],
             technical["usage"]["total_tokens"],
         )
         return AgentResult(
-            content=getattr(message, "content", None) or "(Модель не вернула текст ответа)",
+            content=self._content(message, choice, settings),
             reasoning_content=getattr(message, "reasoning_content", None) or "",
             technical=technical,
         )
@@ -234,7 +299,7 @@ class DeepSeekProvider:
         tool_executor: Callable[[str, dict[str, Any]], dict[str, Any]],
         max_rounds: int = 6,
     ) -> AgentResult:
-        """Выполняет цикл DeepSeek function calling, а сами функции вызывает через MCP."""
+        """Выполняет цикл function calling, а сами функции вызывает через MCP."""
         api_tools = [{
             "type": "function",
             "function": {
@@ -257,27 +322,9 @@ class DeepSeekProvider:
         final_response = None
 
         for round_number in range(1, max_rounds + 1):
-            request_args: dict[str, Any] = {
-                "model": settings.model,
-                "messages": working_messages,
-                "tools": api_tools,
-                "tool_choice": "auto",
-                "temperature": settings.temperature,
-                "top_p": settings.top_p,
-                "stream": False,
-                "response_format": {"type": settings.response_format},
-                "logprobs": settings.logprobs,
-                "extra_body": {
-                    "thinking": {"type": "enabled" if settings.reasoning_enabled else "disabled"},
-                    "reasoning_effort": settings.reasoning_effort,
-                },
-            }
-            if settings.max_tokens is not None:
-                request_args["max_tokens"] = settings.max_tokens
-            if settings.stop:
-                request_args["stop"] = settings.stop
-            if settings.top_logprobs is not None:
-                request_args["top_logprobs"] = settings.top_logprobs
+            request_args = self._request_args(working_messages, settings)
+            request_args["tools"] = api_tools
+            request_args["tool_choice"] = "auto"
 
             response = self._get_client().chat.completions.create(**request_args)
             choice = response.choices[0]
@@ -336,13 +383,13 @@ class DeepSeekProvider:
                     "content": json.dumps(output, ensure_ascii=False),
                 })
         else:
-            raise RuntimeError(f"DeepSeek не завершил цепочку инструментов за {max_rounds} раундов.")
+            raise RuntimeError(f"{self.display_name} не завершил цепочку инструментов за {max_rounds} раундов.")
 
         if final_message is None or final_choice is None or final_response is None:
-            raise RuntimeError("DeepSeek не вернул ответ в цикле инструментов.")
+            raise RuntimeError(f"{self.display_name} не вернул ответ в цикле инструментов.")
         elapsed = time.perf_counter() - started
         technical = {
-            "provider": "deepseek",
+            "provider": self.provider_name,
             "request_id": request_ids[-1] if request_ids else None,
             "request_ids": request_ids,
             "model": getattr(final_response, "model", None) or settings.model,
@@ -353,13 +400,105 @@ class DeepSeekProvider:
             "settings": settings.to_dict(),
             "mcp_tool_calls": tool_audit,
         }
-        logger.info("DeepSeek MCP-цикл завершён | rounds=%s | tool_calls=%s | elapsed=%.3f",
-                    len(request_ids), len(tool_audit), elapsed)
+        logger.info("%s MCP-цикл завершён | rounds=%s | tool_calls=%s | elapsed=%.3f",
+                    self.display_name, len(request_ids), len(tool_audit), elapsed)
         return AgentResult(
-            content=getattr(final_message, "content", None) or "(Модель не вернула текст ответа)",
+            content=self._content(final_message, final_choice, settings),
             reasoning_content=getattr(final_message, "reasoning_content", None) or "",
             technical=technical,
         )
+
+
+class LMStudioProvider(DeepSeekProvider):
+    """OpenAI-compatible адаптер локального сервера LM Studio."""
+
+    provider_name = "lm_studio"
+    display_name = "LM Studio"
+
+    def _get_client(self) -> OpenAI:
+        if self._client is not None:
+            return self._client
+        base_url = os.getenv("LM_STUDIO_BASE_URL", "http://127.0.0.1:1234/v1").rstrip("/")
+        self._client = OpenAI(
+            api_key=os.getenv("LM_STUDIO_API_KEY", "lm-studio-local"),
+            base_url=base_url,
+            timeout=float(os.getenv(
+                "LM_STUDIO_TIMEOUT", str(LM_STUDIO_DEFAULT_TIMEOUT_SECONDS),
+            )),
+            max_retries=0,
+        )
+        return self._client
+
+    def _request_args(
+        self, messages: list[dict[str, Any]], settings: AgentSettings,
+    ) -> dict[str, Any]:
+        # LM Studio rejects the OpenAI/DeepSeek `json_object` value, but
+        # supports grammar-constrained `json_schema`. A permissive object
+        # schema guarantees valid JSON while each helper prompt defines its
+        # own required fields.
+        structured = settings.response_format == "json_object"
+        response_format: dict[str, Any] = (
+            LM_STUDIO_JSON_OBJECT_SCHEMA if structured
+            else {"type": settings.response_format}
+        )
+        max_tokens = settings.max_tokens or 4_096
+        if structured:
+            # Ornith is a reasoning model and reasoning tokens count against
+            # max_tokens even when the UI switch is off. Small helper budgets
+            # otherwise end before the final JSON object is emitted.
+            max_tokens = max(max_tokens, LM_STUDIO_STRUCTURED_MIN_TOKENS)
+        request_args: dict[str, Any] = {
+            "model": settings.model,
+            "messages": messages,
+            "temperature": settings.temperature,
+            "top_p": settings.top_p,
+            "stream": False,
+            "response_format": response_format,
+            "max_tokens": max_tokens,
+        }
+        if settings.stop:
+            request_args["stop"] = settings.stop
+        if settings.logprobs:
+            request_args["logprobs"] = True
+        if settings.top_logprobs is not None:
+            request_args["top_logprobs"] = settings.top_logprobs
+        return request_args
+
+
+class RoutingProvider:
+    """Выбирает локальный или облачный адаптер по model-id запроса."""
+
+    def __init__(
+        self,
+        lm_studio: ChatProvider | None = None,
+        deepseek: ChatProvider | None = None,
+    ) -> None:
+        self.lm_studio = lm_studio or LMStudioProvider()
+        self.deepseek = deepseek or DeepSeekProvider()
+
+    def _provider(self, model: str) -> ChatProvider:
+        if model in LM_STUDIO_MODELS:
+            return self.lm_studio
+        if model in DEEPSEEK_MODELS:
+            return self.deepseek
+        raise ValueError(f"Для модели {model!r} не настроен провайдер.")
+
+    def complete(self, messages: list[dict[str, Any]], settings: AgentSettings) -> AgentResult:
+        return self._provider(settings.model).complete(messages, settings)
+
+    def complete_with_tools(
+        self,
+        messages: list[dict[str, Any]],
+        settings: AgentSettings,
+        tools: list[dict[str, Any]],
+        tool_executor: Callable[[str, dict[str, Any]], dict[str, Any]],
+        max_rounds: int = 6,
+    ) -> AgentResult:
+        provider = self._provider(settings.model)
+        complete_with_tools = getattr(provider, "complete_with_tools", None)
+        if not callable(complete_with_tools):
+            return provider.complete(messages, settings)
+        return complete_with_tools(messages, settings, tools, tool_executor, max_rounds)
 
 
 class Agent:
@@ -580,7 +719,7 @@ class Agent:
             top_p=1,
             reasoning_enabled=False,
             reasoning_effort="low",
-            max_tokens=250,
+            max_tokens=1_024 if settings.model in LM_STUDIO_MODELS else 250,
             response_format="text",
         )
         context = retrieval_context if isinstance(retrieval_context, dict) else {}
@@ -668,6 +807,7 @@ class Agent:
     def extract_stage_handoff(
         self,
         *,
+        model: str = DEFAULT_MODEL,
         source_stage: str,
         target_stage: str,
         event: str,
@@ -710,7 +850,7 @@ class Agent:
             f"Успешная история завершаемого этапа:\n{joined}"
         )
         settings = AgentSettings(
-            model="deepseek-v4-flash",
+            model=model,
             system_prompt="Ты формируешь структурированный handoff между этапами задачи.",
             temperature=0.1,
             top_p=1.0,
@@ -725,7 +865,13 @@ class Agent:
         ], settings)
 
     def extract_memories(
-        self, user_text: str, assistant_text: str, *, allow_project: bool, allow_user: bool
+        self,
+        user_text: str,
+        assistant_text: str,
+        *,
+        allow_project: bool,
+        allow_user: bool,
+        model: str = DEFAULT_MODEL,
     ) -> AgentResult:
         """Одним строгим JSON-вызовом извлекает кандидатов обоих разрешённых scope."""
         scopes = []
@@ -746,7 +892,7 @@ class Agent:
             f"Пользователь:\n{user_text}\n\nАссистент:\n{assistant_text}"
         )
         settings = AgentSettings(
-            model="deepseek-v4-flash", system_prompt="Ты извлекаешь безопасную структурированную память.",
+            model=model, system_prompt="Ты извлекаешь безопасную структурированную память.",
             temperature=0.1, reasoning_enabled=False, reasoning_effort="low",
             max_tokens=2_000, response_format="json_object",
         )
@@ -760,6 +906,8 @@ class Agent:
         current: dict[str, Any],
         user_text: str,
         assistant_text: str,
+        *,
+        model: str = DEFAULT_MODEL,
     ) -> AgentResult:
         """Возвращает полный обновлённый снимок памяти текущей задачи."""
         prompt = (
@@ -777,13 +925,13 @@ class Agent:
             f"Пользователь:\n{user_text}\n\nАссистент:\n{assistant_text}"
         )
         settings = AgentSettings(
-            model="deepseek-v4-flash",
+            model=model,
             system_prompt="Ты обновляешь структурированную память текущей задачи.",
             temperature=0.1,
             top_p=1.0,
             reasoning_enabled=False,
             reasoning_effort="low",
-            max_tokens=2_000,
+            max_tokens=4_096,
             response_format="json_object",
         )
         return self.provider.complete([
@@ -791,7 +939,9 @@ class Agent:
             {"role": "user", "content": prompt},
         ], settings)
 
-    def extract_project_memories_from_history(self, messages: list[dict[str, Any]]) -> AgentResult:
+    def extract_project_memories_from_history(
+        self, messages: list[dict[str, Any]], *, model: str = DEFAULT_MODEL,
+    ) -> AgentResult:
         """Извлекает проектную память из успешной истории по явному действию пользователя."""
         transcript = []
         for message in messages:
@@ -815,7 +965,7 @@ class Agent:
             "Успешная история активной ветки:\n" + "\n\n".join(transcript)
         )
         settings = AgentSettings(
-            model="deepseek-v4-flash", system_prompt="Ты извлекаешь безопасную рабочую память проекта.",
+            model=model, system_prompt="Ты извлекаешь безопасную рабочую память проекта.",
             temperature=0.1, reasoning_enabled=False, reasoning_effort="low",
             max_tokens=2_000, response_format="json_object",
         )
@@ -824,7 +974,13 @@ class Agent:
             {"role": "user", "content": prompt},
         ], settings)
 
-    def extract_facts(self, current_facts: list[dict[str, Any]], user_text: str) -> AgentResult:
+    def extract_facts(
+        self,
+        current_facts: list[dict[str, Any]],
+        user_text: str,
+        *,
+        model: str = DEFAULT_MODEL,
+    ) -> AgentResult:
         """Возвращает обновлённую key-value память в строгом JSON."""
         facts_json = json.dumps(current_facts, ensure_ascii=False, indent=2)
         prompt = (
@@ -842,7 +998,7 @@ class Agent:
             "Не выдумывай фактов и не добавляй пояснений вне JSON."
         )
         settings = AgentSettings(
-            model="deepseek-v4-flash",
+            model=model,
             system_prompt="Ты обновляешь точную структурированную память диалога.",
             temperature=0.1,
             top_p=1.0,
@@ -856,7 +1012,13 @@ class Agent:
             {"role": "user", "content": prompt},
         ], settings)
 
-    def summarize(self, previous_summary: str, exchanges: list[dict[str, Any]]) -> AgentResult:
+    def summarize(
+        self,
+        previous_summary: str,
+        exchanges: list[dict[str, Any]],
+        *,
+        model: str = DEFAULT_MODEL,
+    ) -> AgentResult:
         """Обновляет накопительную память дешёвой моделью без reasoning."""
         transcript: list[str] = []
         for exchange in exchanges:
@@ -875,13 +1037,13 @@ class Agent:
             "Не описывай сам процесс суммаризации и не используй JSON."
         )
         settings = AgentSettings(
-            model="deepseek-v4-flash",
+            model=model,
             system_prompt="Ты создаёшь точную компактную память длительного диалога.",
             temperature=0.2,
             top_p=1.0,
             reasoning_enabled=False,
             reasoning_effort="low",
-            max_tokens=2_000,
+            max_tokens=4_096,
         )
         return self.provider.complete([
             {"role": "system", "content": settings.system_prompt},

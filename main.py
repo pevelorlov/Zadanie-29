@@ -1,4 +1,4 @@
-"""Запуск DeepSeek Agent с автоматическим открытием браузера и логированием."""
+"""Запуск Local LLM Agent с автоматическим открытием браузера и логированием."""
 
 import logging
 import os
@@ -43,7 +43,7 @@ def main() -> None:
     if port != 5000:
         print(f"Порт 5000 занят другой программой. Используется свободный порт {port}.")
         logger.warning("Порт 5000 занят; выбран порт %s", port)
-    print(f"DeepSeek Agent запущен: {url}")
+    print(f"Local LLM Agent запущен: {url}")
     print(f"Общий журнал: {log_paths['app']}")
     print(f"Журнал ошибок: {log_paths['errors']}")
     print("Чтобы остановить сервер, нажмите Ctrl+C.\n")

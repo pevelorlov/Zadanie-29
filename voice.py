@@ -30,7 +30,7 @@ ALLOWED_AUDIO_EXTENSIONS = {".wav", ".webm", ".ogg", ".mp3", ".m4a", ".mp4"}
 class WhisperService:
     """Запускает whisper-server один раз и держит модель загруженной до выхода."""
 
-    def __init__(self, project_dir: Path, autostart: bool = True) -> None:
+    def __init__(self, project_dir: Path, autostart: bool = False) -> None:
         self.project_dir = project_dir
         self.server_path = Path(os.getenv(
             "WHISPER_SERVER_PATH",
@@ -55,10 +55,10 @@ class WhisperService:
         self._start_thread: threading.Thread | None = None
         self._lock = threading.RLock()
         self._phase = "stopped"
-        self._message = "Whisper ещё не запущен."
+        self._message = "Whisper выключен. Включите его рядом с полем сообщения."
         self._last_log = ""
         atexit.register(self.stop)
-        if autostart and os.getenv("WHISPER_AUTOSTART", "true").lower() not in {"0", "false", "no"}:
+        if autostart and os.getenv("WHISPER_AUTOSTART", "false").lower() not in {"0", "false", "no"}:
             self.start()
 
     @property
@@ -270,7 +270,7 @@ class WhisperService:
             self._process = None
             self._server_pid = None
             self._phase = "stopped"
-            self._message = "Whisper остановлен, видеопамять освобождена."
+            self._message = "Whisper выключен для этого приложения."
         if not server_pid:
             return
         with self._runtime_lock():
@@ -317,9 +317,18 @@ class WhisperService:
         ):
             return runtime_pid
         listener_pid = self._listener_pid(self.port)
-        if listener_pid and self._is_project_server(listener_pid) and self._server_is_ready():
+        if listener_pid and self._is_compatible_server(listener_pid) and self._server_is_ready():
             return listener_pid
         return None
+
+    def _is_compatible_server(self, process_id: int) -> bool:
+        """Принимает готовый локальный whisper-server из другой копии проекта."""
+        actual = self._process_path(process_id)
+        return bool(
+            actual
+            and Path(actual).name.lower() == "whisper-server.exe"
+            and self._pid_running(process_id)
+        )
 
     def _is_project_server(self, process_id: int) -> bool:
         actual = self._process_path(process_id)
